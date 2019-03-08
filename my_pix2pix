@@ -1,0 +1,597 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jan  7 19:04:04 2019
+
+@author: zcc
+"""
+
+
+#coding=utf-8
+
+ 
+
+from __future__ import absolute_import
+
+from __future__ import division
+
+from __future__ import print_function
+import collections
+ 
+import cv2
+import tensorflow as tf
+
+import numpy as np
+
+import os
+
+import glob
+
+import random
+MODEL_SAVE_PATH="D:/img/s/"
+
+
+
+ 
+tf.reset_default_graph()
+train_input_dir="D:\\BaiduNetdiskDownload\\CULane\\noline4"       # 训练集输入
+
+train_output_dir="D:/img/s/"  # 训练集输出
+test_input_dir="D:/img/"          # 测试集输入
+
+test_output_dir="D:/img/test_out/"    # 测试集的输出
+
+checkpoint="D:/img/checkpoint/"        # 保存结果的目录
+
+batch_size=1  
+scale_size=286         
+lr=0.0002       
+beta1=0.5       
+l1_weight=10.0  
+
+gan_weight=1.0  
+
+seed=None
+
+EPS = 1e-12       
+
+CROP_SIZE = 256   
+#generate_net = collections.namedtuple("generate_net", "lay1, lay2, lay3, lay4,lay5,lay6,lay7,lay8,deco7,deco6,deco5,deco4,deco3,deco2,deco1,deco0")      
+
+
+def preprocess(image):
+
+    with tf.name_scope("preprocess"):        
+
+        return image * 2 - 1
+
+def deprocess(image):
+
+    with tf.name_scope("deprocess"):        
+
+        return (image + 1) / 2
+def discrim_conv(batch_input, out_channels, stride):
+
+    padded_input = tf.pad(batch_input, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="CONSTANT")
+
+    return tf.layers.conv2d(padded_input, out_channels, kernel_size=4, strides=(stride, stride), padding="valid", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+
+def gen_conv(batch_input, out_channels):
+
+
+
+    initializer = tf.random_normal_initializer(0, 0.02)
+
+
+    return tf.layers.conv2d(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=initializer)
+def gen_deconv(batch_input, out_channels):
+
+    # [batch, in_height, in_width, in_channels] => [batch, out_height, out_width, out_channels]
+
+    initializer = tf.random_normal_initializer(0, 0.02)
+
+    return tf.layers.conv2d_transpose(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=initializer)
+def lrelu(x, a):
+
+    with tf.name_scope("lrelu"):
+
+        x = tf.identity(x)
+
+        return (0.5 * (1 + a)) * x + (0.5 * (1 - a)) * tf.abs(x)
+def batchnorm(inputs):
+
+    return tf.layers.batch_normalization(inputs, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+
+def load_examples(input_dir):
+    #name, _ = os.path.splitext(os.path.basename(input_dir))
+    input_paths = glob.glob(os.path.join(input_dir, "*.png"))
+    #线程读取图像
+   # sess = tf.Session()        
+    path_queue = tf.train.string_input_producer(input_paths, shuffle=True)
+    reader = tf.WholeFileReader()
+    paths, contents = reader.read(path_queue)
+    #转化图像[0-1]
+    raw_input = tf.image.decode_png(contents)
+    raw_input = tf.image.convert_image_dtype(raw_input, dtype=tf.float32) 
+    
+    with tf.control_dependencies([raw_input]):#控制器，先得到raw_input
+            input_x = tf.identity(raw_input)
+    
+    input_x.set_shape([None, None, 3])        
+    a = input_x[tf.shape(input_x)[0]//2:,:,:]*2-1  #[图象像素为[-1,1]]
+
+    b = input_x[:tf.shape(input_x)[0]//2,:,:]*2-1  
+    first_input_img=transform(a)
+    first_label_img=transform(b)
+    #交换一下input和target，第一次看反，直接交换这里就不用改了
+    paths_bach, targets_batch,inputs_batch = tf.train.batch([paths,first_input_img,first_label_img], batch_size=batch_size)
+    return paths_bach,targets_batch,inputs_batch
+
+
+ 
+
+# 图像预处理，翻转、改变形状
+def rgb2bgr(img):
+    r,g,b=cv2.split(img)
+    return cv2.merge([b,g,r])
+
+def transform(image):
+
+    r = image
+
+    r = tf.image.resize_images(r, [scale_size, scale_size], method=tf.image.ResizeMethod.AREA)
+    offset = tf.cast(tf.floor(tf.random_uniform([2], 0, scale_size - CROP_SIZE + 1, seed=seed)), dtype=tf.int32)
+
+    if scale_size > CROP_SIZE:
+
+        r = tf.image.crop_to_bounding_box(r, offset[0], offset[1], CROP_SIZE, CROP_SIZE)
+
+    return r
+
+ 
+
+ 
+
+#创建生成器，这是一个编码解码器的变种，输入输出均为：256*256*3, 像素值为[-1,1]
+
+def create_generator(generator_inputs, generator_outputs_channels):
+     with tf.name_scope("generator"):
+         with tf.variable_scope("encoder_1"):
+            lay1=tf.layers.conv2d(generator_inputs, 64, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+         with tf.variable_scope("encoder_2"):   
+            func2=lrelu(lay1,0.2)
+            lay2=tf.layers.conv2d(func2, 64*2, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            out2=tf.layers.batch_normalization(lay2, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+         with tf.variable_scope("encoder_3"):   
+            func3=lrelu(out2,0.2)
+            lay3=tf.layers.conv2d(func3, 64*4, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            out3=tf.layers.batch_normalization(lay3, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+         with tf.variable_scope("encoder_4"):   
+            func4=lrelu(out3,0.2)
+            lay4=tf.layers.conv2d(func4, 64*8, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            out4=tf.layers.batch_normalization(lay4, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+         with tf.variable_scope("encoder_5"):
+            func5=lrelu(out4,0.2)
+            lay5=tf.layers.conv2d(func5, 64*8, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            out5=tf.layers.batch_normalization(lay5, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+         with tf.variable_scope("encoder_6"):       
+            func6=lrelu(out5,0.2)
+            lay6=tf.layers.conv2d(func6, 64*8, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            out6=tf.layers.batch_normalization(lay6, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+                
+         with tf.variable_scope("encoder_7"):       
+            func7=lrelu(out6,0.2)
+            lay7=tf.layers.conv2d(func7, 64*8, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            out7=tf.layers.batch_normalization(lay7, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+            
+         with tf.variable_scope("encoder_8"):
+            func8=lrelu(out7,0.2)
+            lay8=tf.layers.conv2d(func8, 64*8, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            out8=tf.layers.batch_normalization(lay8, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+         
+    #反卷
+    #delaye7=tf.concat([lay8, out7], axis=3)
+         with tf.variable_scope("decoder_8"):
+             
+            relu7 = tf.nn.relu(out8)
+            deco7=tf.layers.conv2d_transpose(relu7, 64*8, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            norm7=tf.layers.batch_normalization(deco7, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+            deout7 = tf.nn.dropout(norm7, keep_prob=0.5)
+         with tf.variable_scope("decoder_7"):
+            delayer6=tf.concat([deout7, out7], axis=3)
+            relu6 = tf.nn.relu(delayer6)
+            deco6=tf.layers.conv2d_transpose(relu6, 64*8, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            norm6=tf.layers.batch_normalization(deco6, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+            deout6 = tf.nn.dropout(norm6, keep_prob=0.5)
+         with tf.variable_scope("decoder_6"):    
+            delayer5=tf.concat([deout6, out6], axis=3)
+            relu5 = tf.nn.relu(delayer5)
+            deco5=tf.layers.conv2d_transpose(relu5, 64*8, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            norm5=tf.layers.batch_normalization(deco5, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+            deout5 = tf.nn.dropout(norm5, keep_prob=0.5)
+         with tf.variable_scope("decoder_5"):   
+            delayer4=tf.concat([deout5, out5], axis=3)    
+            relu4 = tf.nn.relu(delayer4)
+            deco4=tf.layers.conv2d_transpose(relu4, 64*8, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            norm4=tf.layers.batch_normalization(deco4, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+            deout4 = tf.nn.dropout(norm4, keep_prob=1)
+         with tf.variable_scope("decoder_4"):   
+            delayer3=tf.concat([deout4, out4], axis=3) 
+            relu3 = tf.nn.relu(delayer3)
+            deco3=tf.layers.conv2d_transpose(relu3, 64*4, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            norm3=tf.layers.batch_normalization(deco3, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+            deout3 = tf.nn.dropout(norm3, keep_prob=1)
+         with tf.variable_scope("decoder_3"):   
+            delayer2=tf.concat([deout3, out3], axis=3)   
+            relu2 = tf.nn.relu(delayer2)
+            deco2=tf.layers.conv2d_transpose(relu2, 64*2, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            norm2=tf.layers.batch_normalization(deco2, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+            deout2 = tf.nn.dropout(norm2, keep_prob=1)
+         with tf.variable_scope("decoder_2"):   
+            delayer1=tf.concat([deout2, out2], axis=3)   
+            relu1 = tf.nn.relu(delayer1)
+            deco1=tf.layers.conv2d_transpose(relu1, 64, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+            norm1=tf.layers.batch_normalization(deco1, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+            deout1 = tf.nn.dropout(norm1, keep_prob=1)
+         with tf.variable_scope("decoder_1"):    
+            layer0 = tf.concat([deout1, lay1], axis=3)
+        
+            relu0 = tf.nn.relu(layer0)
+        
+            deco000 = tf.layers.conv2d_transpose(relu0, generator_outputs_channels, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+        
+            deco0 = tf.tanh(deco000)
+            return deco0
+# =============================================================================
+#             return generate_net(lay1=lay1,
+#                                 lay2=lay2,
+#                                 lay3=lay3,
+#                                 lay4=lay4,
+#                                 lay5=lay5,
+#                                 lay6=lay6,
+#                                 lay7=lay7,
+#                                 lay8=lay8,
+#                                 deco7=deco7,
+#                                 deco6=deco6,
+#                                 deco5=deco5,
+#                                 deco4=deco4,
+#                                 deco3=deco3,
+#                                 deco2=deco2,
+#                                 deco1=deco1,
+#                                 deco0=deco0
+#                     )
+# =============================================================================
+#generate_net = collections.namedtuple("generate_net", "lay1, lay2, lay3, lay4,lay5,lay6,lay7,lay8,deco7,deco6,deco5,deco4,deco3,deco2,deco1,deco0,")      
+
+
+def create_discriminator(inputs_batch,deco0):
+    
+    discrim_fake= tf.concat([inputs_batch,deco0], axis=3)
+    with tf.variable_scope("layer_1"):
+        layer_fake1 = discrim_conv(discrim_fake, 64, stride=2)
+        layer_fake_1 = lrelu(layer_fake1, 0.2)
+    with tf.variable_scope("layer_2"):       
+        layer_fake2 = discrim_conv(layer_fake_1, 64*2, stride=2)
+        layer_fake_bach_2=tf.layers.batch_normalization(layer_fake2, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+        layer_fake_2 = lrelu(layer_fake_bach_2, 0.2)    
+    with tf.variable_scope("layer_3"):      
+        layer_fake3 = discrim_conv(layer_fake_2, 64*4, stride=2)
+        layer_fake_bach_3=tf.layers.batch_normalization(layer_fake3, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+        layer_fake_3 = lrelu(layer_fake_bach_3, 0.2)    
+    #last change
+    with tf.variable_scope("layer_4"):
+        layer_fake4 = discrim_conv(layer_fake_3, 64*8, stride=1)
+        layer_fake_bach_4=tf.layers.batch_normalization(layer_fake4, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+        layer_fake_4 = lrelu(layer_fake_bach_4, 0.2)    
+    with tf.variable_scope("layer_5"):      
+        convolved_fake = discrim_conv(layer_fake_4, out_channels=1, stride=1)
+           
+    pre_fake = tf.sigmoid(convolved_fake)
+    return pre_fake
+#discrim_net = collections.namedtuple("discrim_net", "lay1, lay2, lay3, lay4,lay5,lay6,lay7,lay8,deco7,deco6,deco5,deco4,deco3,deco2,deco1,deco0, steps_per_epoch")      
+
+
+
+
+def create_model(inputs, targets):
+
+    with tf.variable_scope("generator"):
+
+        out_channels = int(targets.get_shape()[-1])
+
+        outputs = create_generator(inputs, out_channels)
+    # create two copies of discriminator, one for real pairs and one for fake pairs
+
+    # they share the same underlying variables
+
+    with tf.name_scope("real_discriminator"):
+
+        with tf.variable_scope("discriminator"):
+
+            # 2x [batch, height, width, channels] => [batch, 30, 30, 1]
+
+            predict_real = create_discriminator(inputs, targets) # 条件变量图像和真实图像
+
+    with tf.name_scope("fake_discriminator"):
+
+        with tf.variable_scope("discriminator", reuse=True):
+
+            predict_fake = create_discriminator(inputs, outputs) 
+
+    with tf.name_scope("discriminator_loss"):
+
+
+
+        discrim_loss = tf.reduce_mean(-(tf.log(predict_real + EPS) + tf.log(1 - predict_fake + EPS)))
+
+    with tf.name_scope("generator_loss"):
+
+
+        gen_loss_GAN = tf.reduce_mean(-tf.log(predict_fake + EPS))  
+
+        gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
+
+        gen_loss = gen_loss_GAN * gan_weight + gen_loss_L1 * l1_weight
+
+    with tf.name_scope("discriminator_train"):
+
+        discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("discriminator")]
+        print(discrim_tvars)
+        discrim_optim = tf.train.AdamOptimizer(lr, beta1)
+
+        discrim_grads_and_vars = discrim_optim.compute_gradients(discrim_loss, var_list=discrim_tvars)
+        discrim_train = discrim_optim.apply_gradients(discrim_grads_and_vars)
+
+    with tf.name_scope("generator_train"):
+
+        with tf.control_dependencies([discrim_train]):
+            gen_tvars = [var for var in tf.trainable_variables() if var.name.startswith("generator")]
+            print(gen_tvars)
+            gen_optim = tf.train.AdamOptimizer(lr, beta1)
+
+            gen_grads_and_vars = gen_optim.compute_gradients(gen_loss, var_list=gen_tvars)
+
+            gen_train = gen_optim.apply_gradients(gen_grads_and_vars)
+
+    ema = tf.train.ExponentialMovingAverage(decay=0.99)
+
+    update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_L1])
+    global_step = tf.train.get_or_create_global_step()
+    incr_global_step = tf.assign(global_step, global_step+1)
+    discrim_loss=ema.average(discrim_loss)
+    gen_loss_GAN=ema.average(gen_loss_GAN),          
+
+    gen_loss_L1=ema.average(gen_loss_L1),            
+
+    gen_grads_and_vars=gen_grads_and_vars,           
+    train=tf.group(update_losses, incr_global_step, gen_train)
+
+    return predict_real, predict_fake,  discrim_loss,  gen_loss_GAN,gen_loss_L1,outputs,train
+
+def convert(image):
+    return tf.image.convert_image_dtype(image, dtype=tf.uint8, saturate=True) 
+
+def img_save(array_,bach,step,name):
+    a=array_.reshape(bach,256,256,3)
+    for i in range(bach):
+        cv2.imwrite(train_output_dir+"images\\"+str(step)+name+str(i)+".png",rgb2bgr(a[i]))
+
+
+def train():
+
+    global seed
+    if seed is None:
+        seed = random.randint(0, 2**31 - 1)
+    f_paths,f_targets,f_inputs = load_examples(train_input_dir)
+
+    # 创建模型，inputs和targets是：[batch_size, height, width, channels]
+
+    # 返回值：
+    predict_real, predict_fake,  discrim_loss,  gen_loss_GAN,gen_loss_L1,output,train = create_model(f_inputs, f_targets)
+    print ("create model successful!")
+    #图像处理[-1, 1] => [0, 1]
+
+# =============================================================================
+#     inputs = deprocess(f_inputs)  
+# 
+#     targets = deprocess(f_targets)
+# 
+#     outputs = deprocess(outputs)
+# =============================================================================
+    converted_inputs = convert(deprocess(f_inputs))
+    converted_targets = convert(deprocess(f_targets))
+    converted_outputs = convert(deprocess(output))
+    saver = tf.train.Saver(max_to_keep=20) 
+    saver1=tf.train.Saver()
+    init=tf.global_variables_initializer()
+    with tf.Session() as sess:
+        ckpt = tf.train.get_checkpoint_state(MODEL_SAVE_PATH)
+        if ckpt and ckpt.model_checkpoint_path:
+            saver1.restore(sess,ckpt.model_checkpoint_path)
+        sess.run(init)
+        coord = tf.train.Coordinator()
+        threads = tf.train.start_queue_runners(coord=coord)          
+        print ("begin trainning......")
+        for step in range(200000):
+            def should(i):
+                return i%200
+            print ("step:",step) 
+
+            fetches = {"train": train}
+
+# =============================================================================
+#             if not(should(step)):
+#                 fetches["discrim_loss"] = discrim_loss
+#                 fetches["gen_loss_GAN"] = gen_loss_GAN
+#                 fetches["gen_loss_L1"] = gen_loss_L1       
+# =============================================================================
+            a,b,c=sess.run([converted_targets,converted_outputs,converted_inputs])
+            if not(should(step)):
+                print("saving image")
+                img_save(a,batch_size,step,"target")
+                img_save(b,batch_size,step,"output")
+                img_save(c,batch_size,step,"input")
+            sess.run(fetches)
+            if not(should(step)):
+                print("saving model")
+                saver.save(sess, os.path.join(train_output_dir, "model"), global_step=step)
+
+ 
+
+# 测试
+# =============================================================================
+# 
+# def test():
+# 
+#  # 设置随机数种子的值
+# 
+#     global seed
+# 
+#     if seed is None:
+# 
+#         seed = random.randint(0, 2**31 - 1)
+# 
+#  
+# 
+#     tf.set_random_seed(seed)
+# 
+#     np.random.seed(seed)
+# 
+#     random.seed(seed)
+# 
+#  
+# 
+#     # 创建目录
+# 
+#     if not os.path.exists(test_output_dir):
+# 
+#         os.makedirs(test_output_dir)
+# 
+#     if checkpoint is None:
+# 
+#         raise Exception("checkpoint required for test mode")
+# 
+#  
+# 
+#     # disable these features in test mode
+# 
+#     scale_size = CROP_SIZE
+# 
+#     flip = False
+# 
+#  
+# 
+#     # 加载数据集，得到输入数据和目标数据
+# 
+#     examples = load_examples(test_input_dir)
+# 
+#     print("load successful ! examples count = %d" % examples.count)
+# 
+#  
+# 
+#     # 创建模型，inputs和targets是：[batch_size, height, width, channels]
+# 
+#     model = create_model(inputs,targets)
+# 
+#     print ("create model successful!")
+# 
+#  
+# 
+#  
+# 
+#     #图像处理[-1, 1] => [0, 1]
+# 
+#     inputs = deprocess(examples.inputs)  
+# 
+#     targets = deprocess(examples.targets)
+# 
+#     outputs = deprocess(model.outputs)
+# 
+#  
+# 
+#     # 把[0,1]的像素点转为RGB值：[0,255]
+# 
+#     with tf.name_scope("convert_inputs"):
+# 
+#         converted_inputs = convert(inputs)
+# 
+#     with tf.name_scope("convert_targets"):
+# 
+#         converted_targets = convert(targets)
+# 
+#     with tf.name_scope("convert_outputs"):
+# 
+#         converted_outputs = convert(outputs)
+# 
+#      
+# 
+#  
+# 
+#     # 对图像进行编码以便于保存
+# 
+#     with tf.name_scope("encode_images"):
+# 
+#         display_fetches = {
+# 
+#             "paths": examples.paths,
+# 
+#             # tf.map_fn接受一个函数对象和集合，用函数对集合中每个元素分别处理
+# 
+#             "inputs": tf.map_fn(tf.image.encode_png, converted_inputs, dtype=tf.string, name="input_pngs"),
+# 
+#             "targets": tf.map_fn(tf.image.encode_png, converted_targets, dtype=tf.string, name="target_pngs"),
+# 
+#             "outputs": tf.map_fn(tf.image.encode_png, converted_outputs, dtype=tf.string, name="output_pngs"),
+# 
+#         }
+# 
+#  
+# 
+#     sess=tf.InteractiveSession()  
+# 
+#     saver = tf.train.Saver(max_to_keep=1)
+# 
+#  
+# 
+#     ckpt=tf.train.get_checkpoint_state(checkpoint)
+# 
+#     saver.restore(sess, ckpt.model_checkpoint_path)
+# 
+#  
+# 
+#     start = time.time()
+# 
+#     
+# 
+#     coord = tf.train.Coordinator()
+# 
+#     threads = tf.train.start_queue_runners(coord=coord) 
+# 
+#     for step in range(examples.count):
+# 
+#         results = sess.run(display_fetches)
+# 
+#         filesets = save_images(test_output_dir,results)
+# 
+#         for i, f in enumerate(filesets):
+# 
+#             print("evaluated image", f["name"])
+# 
+#         index_path = append_index(test_output_dir,filesets)
+# 
+#     print("wrote index at", index_path)
+# 
+#     print("rate", (time.time() - start) / max_steps)
+# 
+#  
+# =============================================================================
+
+ # TensorFlow官方文档在数据读取部分中说：在某些时候，样本出队的操作可能会得到一个tf.OutOfRangeError的错误。
+ #这其实是TensorFlow的“文件结束”（EOF） ———— 这就意味着已经达到了最大训练迭代数，已经没有更多可用的样本了。
+
+ 
+
+if __name__ == '__main__':
+
+    # test()
+
+	train()
